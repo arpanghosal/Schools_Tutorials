@@ -1,0 +1,274 @@
+default:
+  image: gitlab-registry.cern.ch/atlas-sit/docker/alma9-atlasos:latest
+  tags:
+    - k8s-cvmfs
+  before_script:
+    - ulimit -n 1048576
+    - set +e
+    - export ATLAS_LOCAL_ROOT_BASE=/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase
+    - source ${ATLAS_LOCAL_ROOT_BASE}/user/atlasLocalSetup.sh --quiet
+    - asetup StatAnalysis,0.3,latest
+
+variables:
+  GIT_SUBMODULE_STRATEGY: normal
+
+stages:
+  - build
+  - check
+  - run
+  - compare_results
+  - webpage
+
+cmake:
+  stage: build
+  script:
+   - mkdir -p build && cd build
+   - cmake -DCMAKE_INSTALL_PREFIX=../install/ .. | tee cmake.log
+  artifacts:
+   paths:
+    - build
+   expire_in: 1d
+
+make_doxygen:
+  stage: build
+  script:
+     - yum -y install doxygen
+     - mkdir -p doc_build && cd doc_build
+     - cmake -DBUILD_DOC=ON .. | tee cmake.log
+     - make doc_doxygen
+     - ls
+  artifacts:
+     paths:
+      - doc_build/docs/
+     expire_in: 1d
+
+build_webpage:
+  stage: build
+  needs: []
+  image: gitlab-registry.cern.ch/authoring/documentation/mkdocs
+  script:
+     - mkdocs build --strict --clean --site-dir www
+  before_script:
+    - "" # overwrite default, do nothing
+  artifacts:
+    paths:
+      - www
+    expire_in: 1 hour
+
+compile:
+  stage: build
+  needs:
+    - cmake
+  script:
+     - cd build
+     - make clean #make sure we don't have residual compilation results
+     - make -j4 2>&1 | tee -a make.log  #dump the log files
+  artifacts:
+     paths:
+      - build
+     expire_in: 1d
+
+compile_latest:
+  stage: build
+  before_script:
+    - set +e # overwrite default, do nothing
+  script:
+     - export ATLAS_LOCAL_ROOT_BASE=/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase
+     - source ${ATLAS_LOCAL_ROOT_BASE}/user/atlasLocalSetup.sh --quiet
+     - asetup main,StatAnalysis,latest
+     - mkdir -p build && cd build
+     - cmake .. | tee cmake.log
+     - make -j4 2>&1 | tee -a make.log  #dump the log files
+  artifacts:
+     paths:
+      - build
+     expire_in: 1d
+  allow_failure: true
+
+install:
+install:
+  stage: build
+  needs:
+    - compile
+  script:
+     - mkdir -p install
+     - cd build
+     - make install | tee -a install.log  #dump the log files
+  artifacts:
+     paths:
+      - install
+     expire_in: 1d
+
+cppcheck:
+  stage: check
+  # image is from https://hub.docker.com/r/neszt/cppcheck-docker
+  image:
+    name: registry.cern.ch/docker.io/neszt/cppcheck-docker:2.12.1
+    entrypoint: [""]
+  before_script:
+    - "" # overwrite default, do nothing
+  needs:
+    - compile
+  script:
+    - cppcheck --version
+    - echo "running cppcheck"
+    - set +e
+    - echo $ROOTSYS
+    - cppcheck --enable=all --verbose --output-file=cppcheck.txt --inline-suppr --language=c++ --suppress=useStlAlgorithm --project=build/compile_commands.json --suppress=missingIncludeSystem --suppress=unusedFunction --suppress=missingInclude --suppress=*:build/* --suppress=*:/cvmfs/* --check-level=exhaustive
+    - cat cppcheck.txt
+    - source test/scripts/cppcheck_output.sh
+  allow_failure: true
+  artifacts:
+    paths:
+      - cppcheck.txt
+    expire_in: 1d
+    when: always
+
+python_config_reader_test:
+  stage: run
+  needs:
+    - compile
+  script:
+     - cd python/ConfigReaderModules/
+     - python3 ConfigReader.py --config ../../test/configs/config.yml
+
+run_filelist:
+  stage: run
+  needs:
+    - compile
+  script:
+     - python3 python/produce_metadata_files.py --root_files_folder test/input/
+  artifacts:
+     paths:
+      - test/input/
+     expire_in: 1d
+
+run_cpp:
+  stage: run
+  needs:
+    - compile
+    - run_filelist
+  script:
+     - ./build/bin/fast-frames.exe
+  artifacts:
+     paths:
+      - ttbar_FS.root
+     expire_in: 1d
+
+produce_trexfitter_config:
+  stage: run
+  needs:
+    - compile
+    - run_python_histograms
+  script:
+     - python3 python/produce_trexfitter_config.py --config test/configs/config.yml
+  allow_failure: true
+
+run_python_histograms:
+  stage: run
+  needs:
+    - compile
+    - run_filelist
+  script:
+     - python3 python/FastFrames.py --config test/configs/config.yml --step h
+  artifacts:
+     paths:
+      - ttbar_FS.root
+      - Wjets.root
+      - Data.root
+     expire_in: 1d
+
+run_python_ntuples:
+  stage: run
+  needs:
+    - compile
+    - run_filelist
+  script:
+     - python3 python/FastFrames.py --config test/configs/config.yml --step n
+  artifacts:
+     paths:
+      - ttbar_FS.root
+     expire_in: 1d
+
+config_reader_comparison:
+  stage: compare_results
+  needs:
+    - compile
+  script:
+     - python3 python/ConfigReaderModules/ConfigReader.py --config test/reference_files/config_reading/config_testing.yml > log.txt
+     - python3 test/python/compare_two_files.py log.txt test/reference_files/config_reading/reference_log.txt
+  allow_failure: true
+
+trex_fitter_configs_comparison:
+  stage: compare_results
+  needs:
+    - compile
+    - run_filelist
+  script:
+     - sudo yum makecache --refresh
+     - yum -y install colordiff
+     - python3 python/FastFrames.py --c test/configs/config_TRExFitter_test.yml
+     - python3 test/python/compare_trex_configs.py
+  allow_failure: true
+
+config_reader_comparison_CLI_samples:
+  stage: compare_results
+  needs:
+    - compile
+  script:
+     - python3 python/ConfigReaderModules/ConfigReader.py --config test/reference_files/config_reading/config_testing.yml --samples Wjets_FS,ttbar_FS --split_n_jobs 10 --job_index 1 > log.txt
+     - python3 test/python/compare_two_files.py log.txt test/reference_files/config_reading/reference_log_samples_ttbar_Wjets.txt
+  allow_failure: true
+
+config_reader_comparison_nested_anchors:
+  stage: compare_results
+  needs:
+    - compile
+  script:
+     - python3 python/ConfigReaderModules/ConfigReader.py --config test/configs/config_nested_anchors_test.yml > log.txt
+     - python3 test/python/compare_two_files.py log.txt test/reference_files/config_reading/reference_nested_anchors.txt
+  allow_failure: true
+
+doxygen_webpage:
+  stage: webpage
+  needs:
+    - make_doxygen
+  before_script:
+    - date
+    - echo "${EOS_ACCOUNT_PASSWORD}" | kinit ${EOS_ACCOUNT_USERNAME}@CERN.CH
+    - klist
+    - cp docs/custom_krb5.conf /etc/krb5.conf
+    - cp docs/custom_ssh.conf /etc/ssh/ssh_config
+    - mkdir -p ~/.ssh
+    - ls ~/.ssh
+    - echo -e "Host lxplus.cern.ch\n\tUser ${EOS_ACCOUNT_USERNAME}\n\tStrictHostKeyChecking no\n\tGSSAPIAuthentication yes\n\tGSSAPIDelegateCredentials yes\n\tProtocol 2\n\tForwardX11 no\n\tIdentityFile ~/.ssh/id_rsa" >> ~/.ssh/config
+    - cat ~/.ssh/config
+    - date
+  script:
+    - ls doc_build/
+    - ls doc_build/docs
+    - ls doc_build/docs/html
+    - tar cvzf - -C doc_build/docs/html/ . | ssh ${EOS_ACCOUNT_USERNAME}@lxplus.cern.ch tar xzf - -C /eos/user/t/topreco/www/fastframesdoxygen
+  only:
+    - main@atlas-amglab/fastframes
+
+documentation_webpage:
+  stage: webpage
+  needs:
+    - build_webpage
+  before_script:
+    - date
+    - echo "${EOS_ACCOUNT_PASSWORD}" | kinit ${EOS_ACCOUNT_USERNAME}@CERN.CH
+    - klist
+    - cp docs/custom_krb5.conf /etc/krb5.conf
+    - cp docs/custom_ssh.conf /etc/ssh/ssh_config
+    - mkdir -p ~/.ssh
+    - ls ~/.ssh
+    - echo -e "Host lxplus.cern.ch\n\tUser ${EOS_ACCOUNT_USERNAME}\n\tStrictHostKeyChecking no\n\tGSSAPIAuthentication yes\n\tGSSAPIDelegateCredentials yes\n\tProtocol 2\n\tForwardX11 no\n\tIdentityFile ~/.ssh/id_rsa" >> ~/.ssh/config
+    - cat ~/.ssh/config
+    - date
+  script:
+    - ls www/
+    - tar cvzf - -C www/ . | ssh ${EOS_ACCOUNT_USERNAME}@lxplus.cern.ch tar xzf - -C /eos/user/t/topreco/www/fastframesdocumentation
+  only:
+    - main@atlas-amglab/fastframes
